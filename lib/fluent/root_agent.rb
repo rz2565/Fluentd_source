@@ -29,13 +29,13 @@ module Fluent
   #
   #                      RootAgent
   #                          |
-  #             +------------+-------------+-------------+
-  #             |            |             |             |
-  #          <label>      <source>      <filter>      <match>
-  #             |
-  #        +----+----+
-  #        |         |
-  #     <filter>   <match>
+  #             +------------+-------------+-------------+------------+
+  #             |            |             |             |            |
+  #          <label>      <source>      <filter>      <match>      <agents>
+  #             |                                                     |
+  #        +----+----+                                           +----+----+
+  #        |         |                                           |         |
+  #     <filter>   <match>                                    <filter>   <match>
   #
   # Relation:
   # * RootAgent has many <label>, <source>, <filter> and <match>
@@ -51,6 +51,7 @@ module Fluent
       super(log: log)
 
       @labels = {}
+      @agents = []
       @inputs = []
       @suppress_emit_error_log_interval = 0
       @next_emit_error_log_time = nil
@@ -60,10 +61,15 @@ module Fluent
       suppress_interval(system_config.emit_error_log_interval) unless system_config.emit_error_log_interval.nil?
       @without_source = system_config.without_source unless system_config.without_source.nil?
       @enable_input_metrics = !!system_config.enable_input_metrics
+
+      @limited_router = nil
+      @limited_mode_agent_for_load = nil
+      @limited_mode_agent_buf_path = File.join(system_config.root_dir || DEFAULT_BACKUP_DIR, 'limited_mode_buffer')
     end
 
     attr_reader :inputs
     attr_reader :labels
+    attr_reader :limited_router
 
     def configure(conf)
       used_worker_ids = []
@@ -161,6 +167,10 @@ module Fluent
           add_source(type, e)
         }
       end
+
+      # TODO Stop doing this when it is not needed.
+      @limited_mode_agent_for_load = create_limited_mode_agent_for_load
+      @agents << @limited_mode_agent_for_load
     end
 
     def setup_error_label(e)
@@ -170,15 +180,15 @@ module Fluent
     end
 
     def lifecycle(desc: false, kind_callback: nil)
-      kind_or_label_list = if desc
-                    [:output, :filter, @labels.values.reverse, :output_with_router, :input].flatten
+      kind_or_agent_list = if desc
+                    [:output, :filter, @agents.reverse, @labels.values.reverse, :output_with_router, :input].flatten
                   else
-                    [:input, :output_with_router, @labels.values, :filter, :output].flatten
+                    [:input, :output_with_router, @labels.values, @agents, :filter, :output].flatten
                   end
-      kind_or_label_list.each do |kind|
+      kind_or_agent_list.each do |kind|
         if kind.respond_to?(:lifecycle)
-          label = kind
-          label.lifecycle(desc: desc) do |plugin, display_kind|
+          agent = kind
+          agent.lifecycle(desc: desc) do |plugin, display_kind|
             yield plugin, display_kind
           end
         else
@@ -229,6 +239,89 @@ module Fluent
         end
       end
       flushing_threads.each{|t| t.join }
+    end
+
+    def shift_to_limited_mode!
+      log.info "shifts to the limited mode"
+
+      # Stop limited_mode_agent_for_load first to avoid using the same filer buffer path
+      if @limited_mode_agent_for_load
+        @limited_mode_agent_for_load.lifecycle do |instance, kind|
+          execute_shutdown_sequence(SHUTDOWN_SEQUENCES[0], instance, kind)
+        end
+      end
+
+      limited_mode_agent_for_output = create_limited_mode_agent_for_output
+      @limited_router = limited_mode_agent_for_output.event_router
+
+      lifecycle_control_list[:input].select do |instance|
+        instance.limited_mode_ready?
+      end.each do |instance|
+        instance.shift_to_limited_mode!
+      end
+
+      SHUTDOWN_SEQUENCES.each do |sequence|
+        if sequence.safe?
+          lifecycle do |instance, kind|
+            next if kind == :input and instance.limited_mode_ready?
+            execute_shutdown_sequence(sequence, instance, kind)
+          end
+          next
+        end
+
+        operation_threads = []
+        callback = ->(){
+          operation_threads.each { |t| t.join }
+          operation_threads.clear
+        }
+        lifecycle(kind_callback: callback) do |instance, kind|
+          next if kind == :input and instance.limited_mode_ready?
+          t = Thread.new do
+            Thread.current.abort_on_exception = true
+            execute_shutdown_sequence(sequence, instance, kind)
+          end
+          operation_threads << t
+        end
+      end
+
+      @agents << limited_mode_agent_for_output
+    end
+
+    def create_limited_mode_agent_for_output
+      limited_mode_agent_for_output = Agent.new(log: log)
+      limited_mode_agent_for_output.configure(
+        Config::Element.new('LIMITED_MODE_OUTPUT', '', {}, [
+          # TODO Use specialized plugin, not out_relabel
+          Config::Element.new('match', '**', {'@type' => 'relabel'}, [
+            Config::Element.new('buffer', 'tag', {
+              '@type' => 'file',
+              'path' => @limited_mode_agent_buf_path,
+              'flush_mode' => 'immediate',
+              'flush_at_shutdown' => 'false',
+              'flush_thread_count' => 0,
+            }, [])
+          ])
+        ])
+      )
+      limited_mode_agent_for_output
+    end
+
+    def create_limited_mode_agent_for_load
+      limited_mode_agent_for_load = Agent.new(log: log)
+      limited_mode_agent_for_load.configure(
+        Config::Element.new('LIMITED_MODE_LOAD', '', {}, [
+          # TODO Use specialized plugin, not out_relabel
+          Config::Element.new('match', '**', {'@type' => 'relabel', '@label' => '@ROOT'}, [
+            Config::Element.new('buffer', 'tag', {
+              '@type' => 'file',
+              'path' => @limited_mode_agent_buf_path,
+              'flush_mode' => 'immediate',
+              'flush_at_shutdown' => 'false',
+            }, [])
+          ])
+        ])
+      )
+      limited_mode_agent_for_load
     end
 
     class ShutdownSequence
