@@ -28,5 +28,10 @@ module Fluent::Plugin
     def process(tag, es)
       router.emit_stream(tag, es)
     end
+
+    def write(chunk)
+      return if chunk.empty?
+      router.emit_stream(chunk.metadata.tag, Fluent::MessagePackEventStream.new(chunk.read))
+    end
   end
 end
